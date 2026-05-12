@@ -7,7 +7,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.94.0",
-    "@arcadeai/arcadejs": "^2.4.1"
+    "@arcadeai/arcadejs": "2.4.1"
   },
   "devDependencies": {
     "@twilio-labs/serverless-runtime-types": "4.0.1"
