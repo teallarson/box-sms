@@ -1,0 +1,16 @@
+{
+  "name": "box-sms",
+  "version": "1.0.0",
+  "description": "SMS → Google Sheet moving-box tracker via Twilio Functions + Anthropic + Arcade MCP",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.94.0",
+    "@arcadeai/arcadejs": "^2.4.1"
+  },
+  "devDependencies": {
+    "@twilio-labs/serverless-runtime-types": "4.0.1"
+  },
+  "private": true
+}
