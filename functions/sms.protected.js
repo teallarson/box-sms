@@ -1,13 +1,16 @@
 /**
  * box-sms — SMS → Google Sheet moving-box tracker
  *
- * Slice 6: Arcade SDK + Anthropic native tool-use loop.
- * (Replaces Slice 5's Anthropic MCP-connector approach, which couldn't send
- *  the `Arcade-User-ID` header Arcade requires for header-auth gateways.)
+ * Vercel AI SDK + Arcade MCP gateway (arcade_header auth).
+ * createMCPClient sends Authorization: Bearer {ARCADE_API_KEY} and
+ * Arcade-User-ID: {ARCADE_USER_ID} on every request so the gateway can
+ * enforce per-user Google Sheets authorization without routing users through
+ * Arcade's own OAuth UI.
  *
  * Required env vars (Twilio Console → Functions Service → Env Vars, and .env locally):
  *   ANTHROPIC_API_KEY   — sk-ant-…
  *   ARCADE_API_KEY      — arc_…
+ *   ARCADE_MCP_URL      — https://api.arcade.dev/mcp/<your-gateway-slug>
  *   ARCADE_USER_ID      — the user identifier in Arcade that has authorized Google Sheets
  *                         (e.g. your email; whatever you used when you OAuth'd Google in Arcade)
  *   GOOGLE_SHEET_ID     — spreadsheet ID from the sheet URL
@@ -22,8 +25,9 @@
  * a valid X-Twilio-Signature header.
  */
 
-const Anthropic = require("@anthropic-ai/sdk");
-const Arcade = require("@arcadeai/arcadejs").default;
+const { generateText, stepCountIs } = require("ai");
+const { createAnthropic } = require("@ai-sdk/anthropic");
+const { createMCPClient } = require("@ai-sdk/mcp");
 
 const SYSTEM = ({ sheetId, sheetTab }) => `
 You manage a Google Sheet of moving boxes.
@@ -56,19 +60,16 @@ const MAX_SMS_CHARS = 1000;
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_REPLY_CHARS = 1400;
 const MAX_TOOL_ITERATIONS = 4;
-const ARCADE_TOOLKIT = "googlesheets"; // Arcade's Google Sheets toolkit slug (matches tool prefix `GoogleSheets.*`)
 const REQUIRED_CONTEXT_KEYS = [
   "ANTHROPIC_API_KEY",
   "ARCADE_API_KEY",
+  "ARCADE_MCP_URL",
   "ARCADE_USER_ID",
   "GOOGLE_SHEET_ID",
   "SHEET_TAB",
   "SYNC_SERVICE_SID",
   "ALLOWED_FROM",
 ];
-
-// Cached across warm invocations of the same Function container.
-let cachedTools = null;
 
 exports.handler = async function (context, event, callback) {
   // Accept both SMS (`+1…`) and WhatsApp (`whatsapp:+1…`) sender formats.
@@ -79,6 +80,7 @@ exports.handler = async function (context, event, callback) {
     return callback(null, r);
   }
 
+  let mcp = null;
   try {
     assertConfigured(context);
 
@@ -101,76 +103,46 @@ exports.handler = async function (context, event, callback) {
     history = trimHistory(history);
     history.push({ role: "user", content: body });
 
-    const anthropic = new Anthropic({ apiKey: context.ANTHROPIC_API_KEY });
-    const arcade = new Arcade({ apiKey: context.ARCADE_API_KEY });
-    const tools = await loadTools(arcade, context.ARCADE_USER_ID);
-
-    // ── Tool-use loop ────────────────────────────────────────────────────────
-    const messages = history.map((m) => ({ role: m.role, content: m.content }));
-    let replyText = "Saved.";
-    let wroteRow = false;
-    let toolFailed = false;
-
-    for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
-      const result = await anthropic.messages.create(
-        {
-          model: "claude-sonnet-4-5",
-          max_tokens: 1024,
-          system: SYSTEM({ sheetId: context.GOOGLE_SHEET_ID, sheetTab: context.SHEET_TAB }),
-          messages,
-          tools,
+    mcp = await createMCPClient({
+      transport: {
+        type: "http",
+        url: context.ARCADE_MCP_URL,
+        headers: {
+          Authorization: `Bearer ${context.ARCADE_API_KEY}`,
+          "Arcade-User-ID": context.ARCADE_USER_ID,
         },
-        { timeout: 12000 },
+      },
+    });
+
+    const anthropicProvider = createAnthropic({ apiKey: context.ANTHROPIC_API_KEY });
+    const tools = await mcp.tools();
+    const messages = history.map((m) => ({ role: m.role, content: m.content }));
+
+    const result = await generateText({
+      model: anthropicProvider("claude-sonnet-4-5"),
+      system: SYSTEM({ sheetId: context.GOOGLE_SHEET_ID, sheetTab: context.SHEET_TAB }),
+      messages,
+      tools,
+      stopWhen: stepCountIs(MAX_TOOL_ITERATIONS),
+    });
+
+    const replyText = truncateReply(
+      result.steps.map((s) => s.text).filter(Boolean).pop() || "Saved.",
+    );
+
+    // Detect whether a Sheets write tool was called and whether any tool errored.
+    const allToolCalls = result.steps.flatMap((s) => s.toolCalls ?? []);
+    const allToolResults = result.steps.flatMap((s) => s.toolResults ?? []);
+    const wroteRow = allToolCalls.some((tc) =>
+      tc.toolName.toLowerCase().includes("updatecells"),
+    );
+    const toolFailed = allToolResults.some((tr) => tr.isError);
+
+    if (toolFailed) {
+      console.error(
+        "box-sms tool error(s):",
+        allToolResults.filter((tr) => tr.isError).map((tr) => `${tr.toolCallId}: ${JSON.stringify(tr.result)}`).join("; "),
       );
-
-      messages.push({ role: "assistant", content: result.content });
-
-      const textBlocks = result.content
-        .filter((b) => b.type === "text")
-        .map((b) => b.text)
-        .join("\n")
-        .trim();
-      if (textBlocks) replyText = truncateReply(textBlocks);
-
-      if (result.stop_reason !== "tool_use") break;
-
-      const toolResults = [];
-      for (const block of result.content) {
-        if (block.type !== "tool_use") continue;
-        try {
-          const exec = await arcade.tools.execute({
-            tool_name: block.name,
-            input: block.input,
-            user_id: context.ARCADE_USER_ID,
-          });
-          const err = exec.output && exec.output.error;
-          if (err) {
-            toolFailed = true;
-            toolResults.push({
-              type: "tool_result",
-              tool_use_id: block.id,
-              content: err.additional_prompt_content || err.message || "Tool error",
-              is_error: true,
-            });
-          } else {
-            if (block.name.toLowerCase().includes("updatecells")) wroteRow = true;
-            toolResults.push({
-              type: "tool_result",
-              tool_use_id: block.id,
-              content: JSON.stringify(exec.output ? exec.output.value : null),
-            });
-          }
-        } catch (e) {
-          toolFailed = true;
-          toolResults.push({
-            type: "tool_result",
-            tool_use_id: block.id,
-            content: String(e && e.message ? e.message : e),
-            is_error: true,
-          });
-        }
-      }
-      messages.push({ role: "user", content: toolResults });
     }
 
     // ── Sync state: clear on successful commit, persist with TTL otherwise ───
@@ -190,32 +162,12 @@ exports.handler = async function (context, event, callback) {
   } catch (err) {
     console.error("box-sms handler failed:", err);
     if (err && err.response) console.error("  response:", err.response);
-    if (err && err.error) console.error("  error:", JSON.stringify(err.error));
     if (err && err.cause) console.error("  cause:", err.cause);
     return sendMessage(callback, "Sorry, I couldn't save that. Please try again.");
+  } finally {
+    if (mcp) await mcp.close().catch(() => {});
   }
 };
-
-async function loadTools(arcade, userId) {
-  if (cachedTools) return cachedTools;
-  const tools = [];
-  // Stainless paginator: for-await yields each item across pages.
-  for await (const tool of arcade.tools.formatted.list({
-    format: "anthropic",
-    toolkit: ARCADE_TOOLKIT,
-    user_id: userId,
-  })) {
-    tools.push(tool);
-  }
-  if (tools.length === 0) {
-    throw new Error(
-      `Arcade returned 0 tools for toolkit="${ARCADE_TOOLKIT}". ` +
-        `Check the toolkit slug or whether ${userId} has the toolkit enabled.`,
-    );
-  }
-  cachedTools = tools;
-  return tools;
-}
 
 function sendMessage(callback, text) {
   const twiml = new Twilio.twiml.MessagingResponse();

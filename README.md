@@ -12,7 +12,7 @@ Number   Type              Room      Contents
 2        small cardboard   bedroom   books, yearbooks
 ```
 
-**Stack:** Twilio Functions · Twilio Sync · Anthropic Claude · Arcade Google Sheets · Google Sheets
+**Stack:** Twilio Functions · Twilio Sync · Vercel AI SDK · Anthropic Claude · Arcade MCP Gateway · Google Sheets
 
 ---
 
@@ -49,9 +49,13 @@ Get an API key at [console.anthropic.com](https://console.anthropic.com) → API
 
 ### 3. Arcade
 
-- Dashboard → **Auth** → connect your Google account (authorize Google Sheets)
-- Dashboard → **API Keys** → create a key
-- Note the user identifier you used (e.g. your email) — this becomes `ARCADE_USER_ID`
+1. Dashboard → **Auth** → connect your Google account (authorize Google Sheets)
+2. Dashboard → **API Keys** → create a key → copy it as `ARCADE_API_KEY`
+3. Dashboard → **MCP Gateways** → **Create**:
+   - Auth type: **arcade_header**
+   - Allowlist: `Google_Sheets.GetSpreadsheet`, `Google_Sheets.UpdateCells`
+   - Copy the gateway URL as `ARCADE_MCP_URL` (e.g. `https://api.arcade.dev/mcp/<slug>`)
+4. Note the user identifier you used when authorizing Google (e.g. your email) — this becomes `ARCADE_USER_ID` and is sent as the `Arcade-User-ID` header on every MCP request
 
 ### 4. Google Sheet
 
@@ -92,7 +96,8 @@ Copy the `/sms` URL it prints and paste it into your WhatsApp Sandbox Configurat
 |---|---|
 | `ANTHROPIC_API_KEY` | console.anthropic.com → API Keys |
 | `ARCADE_API_KEY` | Arcade Dashboard → API Keys |
-| `ARCADE_USER_ID` | The identifier (e.g. email) you used when authorizing Google in Arcade |
+| `ARCADE_MCP_URL` | Arcade Dashboard → MCP Gateways → your gateway URL |
+| `ARCADE_USER_ID` | The identifier (e.g. email) you used when authorizing Google in Arcade — sent as `Arcade-User-ID` header |
 | `GOOGLE_SHEET_ID` | Long string in sheet URL between `/d/` and `/edit` |
 | `SHEET_TAB` | Tab name at the bottom of the sheet (e.g. `Sheet1`) |
 | `SYNC_SERVICE_SID` | Twilio Console → Sync → Services → your `IS…` SID |
